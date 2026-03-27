@@ -6,10 +6,11 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { s3Client, S3_BUCKET_NAME } from "../config/s3.config.js";
 import { db } from "../db/db.js";
 import { video } from "../db/schema/video.js";
+import { eq, and } from "drizzle-orm";
 import { v4 as uuidv4 } from "uuid";
 import type { AuthRequest } from "../middleware/auth.middleware.js";
 
-const getPresignedUrl: RequestHandler = asyncHandler(
+const createVideo: RequestHandler = asyncHandler(
   async (req: AuthRequest, res: Response): Promise<void> => {
     const userId = req.userId;
     if (!userId) {
@@ -17,21 +18,53 @@ const getPresignedUrl: RequestHandler = asyncHandler(
       return;
     }
 
-    const { filename, contentType, size } = req.body;
-    if (!filename || !contentType || !size) {
+    const { filename, contentType, size, format } = req.body;
+    if (
+      !filename ||
+      !contentType ||
+      !size ||
+      !format ||
+      !Array.isArray(format)
+    ) {
       res
         .status(400)
         .json(
           new ApiResponse(
             400,
             null,
-            "Missing required fields: filename, contentType, size",
+            "Missing required fields: filename, contentType, size, format (array)",
           ),
         );
       return;
     }
 
-    const s3Key = `uploads/${userId}/${uuidv4()}-${filename}`;
+    const validFormats = ["144", "240", "360", "480", "720", "1080"];
+    const isValidFormat = format.every((f: string) => validFormats.includes(f));
+    if (!isValidFormat) {
+      res
+        .status(400)
+        .json(
+          new ApiResponse(
+            400,
+            null,
+            "Invalid format. Valid formats: 144, 240, 360, 480, 720",
+          ),
+        );
+      return;
+    }
+
+    const videoId = uuidv4();
+    const s3Key = `uploads/${userId}/${videoId}-${filename}`;
+
+    await db.insert(video).values({
+      id: videoId,
+      userId,
+      s3Key,
+      format,
+      size,
+      hlsIndexKey: "",
+      status: "PENDING",
+    });
 
     const command = new PutObjectCommand({
       Bucket: S3_BUCKET_NAME,
@@ -43,15 +76,16 @@ const getPresignedUrl: RequestHandler = asyncHandler(
       expiresIn: 3600,
     });
 
-    res.status(200).json(
+    res.status(201).json(
       new ApiResponse(
-        200,
+        201,
         {
+          videoId,
           presignedUrl,
           s3Key,
           expiresIn: 3600,
         },
-        "Presigned URL generated successfully",
+        "Video record created successfully",
       ),
     );
   },
@@ -65,34 +99,25 @@ const uploadComplete: RequestHandler = asyncHandler(
       return;
     }
 
-    const { s3Key, format, size } = req.body;
-    if (!s3Key || !size) {
+    const { videoId } = req.body;
+    if (!videoId) {
       res
         .status(400)
-        .json(
-          new ApiResponse(400, null, "Missing required fields: s3Key, size"),
-        );
+        .json(new ApiResponse(400, null, "Missing required field: videoId"));
       return;
     }
 
-    const videoId = uuidv4();
-
-    await db.insert(video).values({
-      id: videoId,
-      userId,
-      s3Key,
-      format: format || [],
-      size,
-      hlsIndexKey: "",
-      status: "PENDING",
-    });
+    await db
+      .update(video)
+      .set({ status: "UPLOADING" })
+      .where(and(eq(video.id, videoId), eq(video.userId, userId)));
 
     res
       .status(200)
       .json(
         new ApiResponse(
           200,
-          { videoId, status: "PENDING" },
+          { status: "UPLOADING" },
           "Upload completed successfully",
         ),
       );
@@ -107,14 +132,104 @@ const uploadFailure: RequestHandler = asyncHandler(
       return;
     }
 
-    const { s3Key, error } = req.body;
+    const { videoId, error } = req.body;
+    if (!videoId) {
+      res
+        .status(400)
+        .json(new ApiResponse(400, null, "Missing required field: videoId"));
+      return;
+    }
+
+    await db
+      .delete(video)
+      .where(and(eq(video.id, videoId), eq(video.userId, userId)));
 
     console.error(
-      `Upload failed for user ${userId}, key: ${s3Key}, error: ${error}`,
+      `Upload failed for user ${userId}, videoId: ${videoId}, error: ${error}`,
     );
 
-    res.status(200).json(new ApiResponse(200, null, "Upload failure recorded"));
+    res
+      .status(200)
+      .json(
+        new ApiResponse(200, null, "Upload failure recorded and video deleted"),
+      );
   },
 );
 
-export { getPresignedUrl, uploadComplete, uploadFailure };
+const updateVideo: RequestHandler = asyncHandler(
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json(new ApiResponse(401, null, "Unauthorized"));
+      return;
+    }
+
+    const { videoId } = req.params;
+    const { format } = req.body;
+
+    if (!videoId || Array.isArray(videoId)) {
+      res.status(400).json(new ApiResponse(400, null, "Invalid videoId param"));
+      return;
+    }
+
+    if (!format || !Array.isArray(format)) {
+      res
+        .status(400)
+        .json(
+          new ApiResponse(400, null, "Missing required field: format (array)"),
+        );
+      return;
+    }
+
+    const validFormats = ["144", "240", "360", "480", "720"];
+    const isValidFormat = format.every((f: string) => validFormats.includes(f));
+    if (!isValidFormat) {
+      res
+        .status(400)
+        .json(
+          new ApiResponse(
+            400,
+            null,
+            "Invalid format. Valid formats: 144, 240, 360, 480, 720",
+          ),
+        );
+      return;
+    }
+
+    await db
+      .update(video)
+      .set({ format })
+      .where(and(eq(video.id, videoId), eq(video.userId, userId)));
+
+    res
+      .status(200)
+      .json(new ApiResponse(200, { format }, "Format updated successfully"));
+  },
+);
+
+const deleteVideo: RequestHandler = asyncHandler(
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json(new ApiResponse(401, null, "Unauthorized"));
+      return;
+    }
+
+    const { videoId } = req.params;
+
+    if (!videoId || Array.isArray(videoId)) {
+      res.status(400).json(new ApiResponse(400, null, "Invalid videoId param"));
+      return;
+    }
+
+    await db
+      .delete(video)
+      .where(and(eq(video.id, videoId), eq(video.userId, userId)));
+
+    res
+      .status(200)
+      .json(new ApiResponse(200, null, "Video deleted successfully"));
+  },
+);
+
+export { createVideo, uploadComplete, uploadFailure, updateVideo, deleteVideo };

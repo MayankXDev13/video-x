@@ -10,8 +10,17 @@ import {
 } from "drizzle-orm/pg-core";
 import { user } from "./auth.js";
 
+export const videoFormat = pgEnum("video_format", [
+  "144",
+  "240",
+  "360",
+  "480",
+  "720",
+]);
+
 export const videoStatus = pgEnum("video_status", [
   "PENDING",
+  "UPLOADING",
   "PROCESSING",
   "READY",
   "FAILED",
@@ -24,7 +33,7 @@ export const video = pgTable(
     userId: text("user_id")
       .notNull()
       .references(() => user.id, { onDelete: "cascade" }),
-    format: integer("format").array(),
+    format: videoFormat("format").array(),
     size: integer("size").notNull(),
     s3Key: text("s3_key").notNull(),
     hlsIndexKey: text("hls_index_key").notNull(),
